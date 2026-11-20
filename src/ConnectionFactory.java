@@ -13,9 +13,9 @@ public class ConnectionFactory {
             throw new IllegalArgumentException("Unsupported database");
         }
 
-        String url = "jdbc:postgresql://localhost:5432/adb_deadlock";
-        String username = "kirubelbayru";
-        String password = "";
+        String url = "jdbc:postgresql://localhost:5433/adb_benchmark";
+        String username = "postgres";
+        String password = "1234";
        // String password = System.getenv("DB_PASSWORD");
 
         try {
