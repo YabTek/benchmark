@@ -2,17 +2,19 @@ import java.sql.Connection;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.SQLException;
-import java.util.ArrayList;
-import java.util.Arrays;
+import java.sql.Statement;
 import java.util.Random;
+import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
-import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.ThreadLocalRandom;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.LongAdder;
 
 /**
- * 
+ *
  * @author Martin Schaeler martin.schaeler@plus.ac.at
- * 
+ *
 # Permission is hereby granted, free of charge, to any person obtaining a copy
 # of this software and associated documentation files (the "Software"), to deal
 # in the Software without restriction, including without limitation the rights
@@ -30,281 +32,225 @@ import java.util.concurrent.atomic.AtomicInteger;
 # LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 # THE SOFTWARE.
-*/
+ */
+
 
 public class Blocking {
-	public static int num_taks=30;
-	public static int num_queries_per_task = 3;
-	
-	Connection con;
-	Random rand = new Random(123456);
-	int num_tuple = 50000;
-	double max_value = 50.0f;
-	AtomicInteger tasks_finished;
-	
-	public Blocking(){
-		tasks_finished = new AtomicInteger(0);  //AtomicInteger provides thread-safe operations, while updating the same int value
-	}
-	
-	void executeSQL(String sql, Connection con){
-		java.sql.Statement stmt;
-		try {
-			stmt = con.createStatement();
-			stmt.execute(sql);
-			System.out.println("Executing "+sql);
-			stmt.close();
-		} catch (SQLException e) {
-			e.printStackTrace();
-		}
-	}
-	
-	void cerateDB(){	
-		try {
-			Connection con = ConnectionFactory.getDefaultParameterConnection(ConnectionFactory.POSTGRESQL);
-			executeSQL("DROP TABLE IF EXISTS blocking_data;",con);
-			executeSQL("CREATE TABLE blocking_data ( data_id integer primary key, data_value float, modified_by integer);",con);
-			
-			PreparedStatement ps;
-			con.setAutoCommit(false); //Setting autoCommit to false allows multiple database operations to be grouped into one transaction.
-			ps = con.prepareStatement("INSERT INTO blocking_data VALUES (?, ?, ?)",ResultSet.TYPE_SCROLL_SENSITIVE, ResultSet.CONCUR_UPDATABLE);
-			
-			for(int i=0;i<num_tuple;i++){ // num_tuple
-				ps.setInt(1, i);
+    public static int num_taks = 30;
+    public static int num_queries_per_task = 3;
 
-				ps.setDouble(2,rand.nextDouble()*max_value);
+    Random rand = new Random(123456);             // only used to load the data
+    int num_tuple = 50000;
+    double max_value = 50.0f;
 
-				ps.setInt(3, 0);
-
-				ps.addBatch();
-				ps.clearParameters();
-			}
+    AtomicInteger tasks_finished = new AtomicInteger(0);  // committed transactions
+    AtomicInteger deadlocks = new AtomicInteger(0);       // deadlock retries
 
 
-			
-			int[] results = ps.executeBatch();
-			con.commit();
-			con.close();
-			System.out.println(Arrays.toString(results));
-		} catch (SQLException e) {
-			e.printStackTrace();
-		}
-	}
-	
-//	public static void main(String[] args){
-//		//Create DB
-//		Blocking b = new Blocking();
-//		b.cerateDB();
-//
-//		//Create task and their queries
-//		ArrayList<Blocking.Blocker> my_tasks = new ArrayList<Blocking.Blocker>(num_taks);
-//
-//		for(int task=0;task<num_taks;task++){
-//			my_tasks.add(b.new Blocker(task)); //This creates 30 Blocker objects with IDs from 0 to 29.
-//		}
-//
-//		//Execute tasks
-//		ThreadPoolExecutor executor =
-//				  (ThreadPoolExecutor) Executors.newFixedThreadPool(4);//XXX - Do not change the number of threads used
-//		double start, stop;
-//		start = System.currentTimeMillis();
-//		for(Blocker task : my_tasks) {
-//			executor.execute(task);
-//		}
-//		executor.shutdown();
-//
-//		//wait for the tasks to finish
-//		while(!executor.isTerminated()) {
-//			try {
-//				Thread.sleep(100); //Keep waiting every 0.1s until the executor is completely done.
-//			} catch (InterruptedException e) {
-//				e.printStackTrace();
-//			}
-//		}
-//		stop = System.currentTimeMillis();
-//		System.out.println("[DONE] Task execution after roughly "+(stop-start)+" ms finished: "+b.tasks_finished+" of "+num_taks);
-//	}
+    static final java.io.PrintStream OUT = new java.io.PrintStream(
+            new java.io.BufferedOutputStream(new java.io.FileOutputStream(java.io.FileDescriptor.out), 1 << 16), false);
 
-    //2. continuous stream
+
+    Connection openConnection() throws SQLException {
+        Connection c = ConnectionFactory.getDefaultParameterConnection(ConnectionFactory.POSTGRESQL);
+
+
+        c.setAutoCommit(false);
+        return c;
+    }
+
+    // Measurement: running time per transaction type (from the start of the first attempt until the commit)
+    static final String[] TYPES = {"point read (60%)", "insert (10%)", "full scan (10%)", "write (20%)"};
+    final LongAdder[] typeCount = {new LongAdder(), new LongAdder(), new LongAdder(), new LongAdder()};
+    final LongAdder[] typeNanos = {new LongAdder(), new LongAdder(), new LongAdder(), new LongAdder()};
+
+    void executeSQL(String sql, Connection con) {
+        try (Statement stmt = con.createStatement()) {
+            stmt.execute(sql);
+            System.out.println("Executing " + sql);
+        } catch (SQLException e) {
+            e.printStackTrace();
+        }
+    }
+
+    // Loads 50,000 tuples. Not part of the measured time.
+    void cerateDB() {
+        try {
+            Connection con = ConnectionFactory.getDefaultParameterConnection(ConnectionFactory.POSTGRESQL);
+            executeSQL("DROP TABLE IF EXISTS blocking_data;", con);  // also removes tuples inserted by the last run
+            executeSQL("CREATE TABLE blocking_data ( data_id integer primary key, data_value float, modified_by integer);", con);
+
+
+            executeSQL("DO $$ BEGIN EXECUTE format('ALTER DATABASE %I SET synchronous_commit = off', current_database()); END $$;", con);
+
+            con.setAutoCommit(false);
+            PreparedStatement ps = con.prepareStatement("INSERT INTO blocking_data VALUES (?, ?, ?)");
+            for (int i = 0; i < num_tuple; i++) {
+                ps.setInt(1, i);
+                ps.setDouble(2, rand.nextDouble() * max_value);
+                ps.setInt(3, 0);
+                ps.addBatch();
+            }
+            int[] results = ps.executeBatch();
+            con.commit();
+            ps.close();
+            con.close();
+            System.out.println("Loaded " + results.length + " tuples");
+        } catch (SQLException e) {
+            e.printStackTrace();
+        }
+    }
+
     public static void main(String[] args) throws InterruptedException {
+
+        int workers = args.length > 0 ? Integer.parseInt(args[0]) : 4;
+        int seconds = args.length > 1 ? Integer.parseInt(args[1]) : 20;
+
         Blocking b = new Blocking();
         b.cerateDB();
 
-        //int workers = 4;
-
-        //3. vary number of threads
-        int workers = args.length > 0 ? Integer.parseInt(args[0]) : 4;
-
-        long durationNanos = java.util.concurrent.TimeUnit.SECONDS.toNanos(30);
+        long durationNanos = TimeUnit.SECONDS.toNanos(seconds);
         AtomicInteger nextTaskId = new AtomicInteger(0);
-
-        var executor = Executors.newFixedThreadPool(workers);
+        ExecutorService executor = Executors.newFixedThreadPool(workers);
         long start = System.nanoTime();
 
-        for (int worker = 0; worker < workers; worker++) {
+        for (int w = 0; w < workers; w++) {
             executor.execute(() -> {
                 while (System.nanoTime() - start < durationNanos) {
-                    int taskId = nextTaskId.getAndIncrement();
-                    b.new Blocker(taskId).run();
+                    b.new Blocker(nextTaskId.getAndIncrement()).run();
                 }
             });
         }
-
         executor.shutdown();
-        executor.awaitTermination(Long.MAX_VALUE, java.util.concurrent.TimeUnit.NANOSECONDS);
+        executor.awaitTermination(Long.MAX_VALUE, TimeUnit.NANOSECONDS);
 
+        // throughput = committed transactions per second
+        double elapsed = (System.nanoTime() - start) / 1e9;
+        OUT.flush();                         // write out the remaining buffered lines
 
-        //3. Add time measure for benchmarking the throughput
-        double elapsedSeconds = (System.nanoTime() - start) / 1_000_000_000.0;
+        //reset synchronous_commit for the database, so it does not stay off after the benchmark
+        try (Connection c = ConnectionFactory.getDefaultParameterConnection(ConnectionFactory.POSTGRESQL)) {
+            b.executeSQL("DO $$ BEGIN EXECUTE format('ALTER DATABASE %I RESET synchronous_commit', current_database()); END $$;", c);
+        } catch (SQLException e) {
+            e.printStackTrace();
+        }
         int committed = b.tasks_finished.get();
-
+        System.out.println();
         System.out.println("Worker threads: " + workers);
         System.out.println("Transactions started: " + nextTaskId.get());
         System.out.println("Transactions committed: " + committed);
-        System.out.printf("Elapsed time: %.3f seconds%n", elapsedSeconds);
-        System.out.printf("Throughput: %.2f commits/second%n",
-                committed / elapsedSeconds);
+        System.out.println("Deadlock retries: " + b.deadlocks.get());
+        System.out.printf("Elapsed time: %.3f seconds%n", elapsed);
+        System.out.printf("Throughput: %.2f commits/second%n", committed / elapsed);
+
+        // where does the transaction running time go?
+        long all = 0;
+        for (LongAdder n : b.typeNanos) all += n.sum();
+        System.out.println();
+        System.out.printf("%-18s %10s %14s %16s%n", "Transaction type", "Count", "Avg time (ms)", "Share of time");
+        for (int k = 0; k < TYPES.length; k++) {
+            long c = b.typeCount[k].sum(), n = b.typeNanos[k].sum();
+            System.out.printf("%-18s %10d %14.3f %15.1f%%%n", TYPES[k], c,
+                    c == 0 ? 0.0 : n / 1e6 / c, all == 0 ? 0.0 : 100.0 * n / all);
+        }
     }
-	
-	/**
-	 * This is simply a task attempting to hold many write locks for a long time and updating major parts of the database.
-	 *
-	 */
-	public class Blocker implements Runnable  {
-		final int task;
-        //1a
+
+    /** One transaction (a Blocker instance). */
+    public class Blocker implements Runnable {
+        final int task;
+        //  dice p in [0,1]  for each transaction; it decides the type
         final double p;
-		final double [] start_range;
-		final double [] stop_range;
-		
-		public Blocker(int id){
-			this.task = id;
-            //1a
-            this.p = java.util.concurrent.ThreadLocalRandom.current().nextDouble();
-			this.start_range = new double[num_queries_per_task];
-			this.stop_range  = new double[num_queries_per_task];
-			for(int q=0;q<num_queries_per_task;q++) {
-				stop_range[q]  = rand.nextDouble()*max_value;
+        // The rows are chosen once, so a retry after a deadlock repeats exactly the SAME transaction
+        final int[] ids;
+        final double[] start_range = new double[num_queries_per_task];
+        final double[] stop_range = new double[num_queries_per_task];
 
-				start_range[q] = rand.nextDouble()*stop_range[q]; // stop_range * (0-1)
+        public Blocker(int id) {
+            this.task = id;
+            this.p = ThreadLocalRandom.current().nextDouble();
+            this.ids = ThreadLocalRandom.current().ints(0, num_tuple).distinct().limit(num_queries_per_task).toArray();
+        }
 
-			}
-		}
-		
-		@Override
-		public void run() {
-			Connection con=null;//XXX - Yes there needs to be a separate Connection per blocking taks. Otherwise strange things can happen
-			con = ConnectionFactory.getDefaultParameterConnection(ConnectionFactory.POSTGRESQL);//XXX This is the class you need to create, but does not have to be in the Repo
+        // Every transaction must eventually commit: a deadlock victim is rolled back and retried
+        @Override
+        public void run() {
+            long t0 = System.nanoTime();
+            while (!attempt()) {
+                deadlocks.incrementAndGet();
+            }
+            int k = p < 0.6 ? 0 : p < 0.7 ? 1 : p < 0.8 ? 2 : 3;
+            typeNanos[k].add(System.nanoTime() - t0);
+            typeCount[k].increment();
+        }
 
-			try {
-				con.setAutoCommit(false);
-				con.setTransactionIsolation(Connection.TRANSACTION_READ_COMMITTED); //It prevents a transaction from reading uncommitted changes made by another transaction.
+        /** @return true when finished, false when aborted by a deadlock (then it is retried) */
+        boolean attempt() {
+            Connection con = null;
+            try {
+                con = openConnection();
 
-                //1b
                 if (p < 0.6) {
-                    var random = java.util.concurrent.ThreadLocalRandom.current();
-
-                    int first = random.nextInt(num_tuple);
-
-                    int second;
-                    do {
-                        second = random.nextInt(num_tuple);
-                    } while (second == first);
-
-                    int third;
-                    do {
-                        third = random.nextInt(num_tuple);
-                    } while (third == first || third == second);
-
+                    //  read-only multi-point query, 3 distinct tuples, print the sum
                     double sum = 0.0;
-                    String sql = "SELECT data_value FROM blocking_data WHERE data_id = ?";
-
-                    try (PreparedStatement read = con.prepareStatement(sql)) {
-                        for (int rowId : new int[] {first, second, third}) {
+                    try (PreparedStatement read = con.prepareStatement(
+                            "SELECT data_value FROM blocking_data WHERE data_id = ?")) {
+                        for (int rowId : ids) {
                             read.setInt(1, rowId);
-
-                            try (ResultSet result = read.executeQuery()) {
-                                if (!result.next()) {
-                                    throw new SQLException("Row " + rowId + " was not found");
-                                }
-                                sum += result.getDouble("data_value");
+                            try (ResultSet rs = read.executeQuery()) {
+                                if (rs.next()) sum += rs.getDouble(1);
                             }
                         }
                     }
-
                     con.commit();
                     tasks_finished.incrementAndGet();
-                    con.close();
-
-                    System.out.println("Task " + task + " read sum: " + sum);
-                    return;
-                }
-
-                //1c
-                if (p >= 0.6 && p < 0.7) {
-                    int newId = num_tuple + task;
-                    double newValue = java.util.concurrent.ThreadLocalRandom.current()
-                            .nextDouble(max_value);
-
-                    String sql = "INSERT INTO blocking_data (data_id, data_value, modified_by) "
-                            + "VALUES (?, ?, ?)";
-
-                    try (PreparedStatement insert = con.prepareStatement(sql)) {
-                        insert.setInt(1, newId);
-                        insert.setDouble(2, newValue);
+                    OUT.println("Task " + task + " read sum: " + sum);
+                } else if (p < 0.7) {
+                    //insert one new tuple (removed again by cerateDB() on the next start)
+                    try (PreparedStatement insert = con.prepareStatement(
+                            "INSERT INTO blocking_data (data_id, data_value, modified_by) VALUES (?, ?, ?)")) {
+                        insert.setInt(1, num_tuple + task);
+                        insert.setDouble(2, ThreadLocalRandom.current().nextDouble(max_value));
                         insert.setInt(3, task);
                         insert.executeUpdate();
                     }
-
-                    con.commit();
+                    con.commit();                                                          //does not wait for the disk
                     tasks_finished.incrementAndGet();
-                    con.close();
-                    return;
-                }
-
-                //1d
-                if (p >= 0.7 && p < 0.8) {
-                    String sql = "SELECT SUM(data_value) FROM blocking_data";
+                    OUT.println("Task " + task + " inserted tuple " + (num_tuple + task));
+                } else if (p < 0.8) {
+                    // full table scan, print the sum
                     double sum;
-
-                    try (PreparedStatement scan = con.prepareStatement(sql);
-                         ResultSet result = scan.executeQuery()) {
-                        result.next();
-                        sum = result.getDouble(1);
+                    try (PreparedStatement scan = con.prepareStatement("SELECT SUM(data_value) FROM blocking_data");
+                         ResultSet rs = scan.executeQuery()) {
+                        rs.next();
+                        sum = rs.getDouble(1);
                     }
-
                     con.commit();
                     tasks_finished.incrementAndGet();
-                    con.close();
-
-                    System.out.println("Task " + task + " table sum: " + sum);
-                    return;
-                }
-
-                //1e
-                var random = java.util.concurrent.ThreadLocalRandom.current();
-                String sql = "UPDATE blocking_data "
-                        + "SET data_value = ?, modified_by = ? "
-                        + "WHERE data_id = ?";
-
-                try (PreparedStatement update = con.prepareStatement(sql)) {
-                    for (int q = 0; q < num_queries_per_task; q++) {
-                        int rowId = random.nextInt(num_tuple);
-                        double newValue = random.nextDouble(max_value);
-
-                        update.setDouble(1, newValue);
-                        update.setInt(2, task);
-                        update.setInt(3, rowId);
-                        update.executeUpdate();
+                    OUT.println("Task " + task + " table sum: " + sum);
+                } else {
+                    // write query, 3 updates, each modifies a single tuple
+                    try (PreparedStatement update = con.prepareStatement(
+                            "UPDATE blocking_data SET data_value = ?, modified_by = ? WHERE data_id = ?")) {
+                        for (int rowId : ids) {
+                            update.setDouble(1, ThreadLocalRandom.current().nextDouble(max_value));
+                            update.setInt(2, task);
+                            update.setInt(3, rowId);
+                            update.executeUpdate();
+                        }
                     }
+                    con.commit();                                                          //does not wait for the disk
+                    int n = tasks_finished.incrementAndGet();
+                    OUT.println("Done task " + task + ". I am finisher number " + n);
                 }
-
-				con.commit();
-				int num_finished = tasks_finished.incrementAndGet();
-				con.close();
-				System.out.println("Done task "+task+". I am finisher number "+num_finished);
-			} catch (SQLException e) {
-				System.err.println("Task "+task+" "+e.getMessage());
-			}
-		}
-	}
+                return true;
+            } catch (SQLException e) {
+                try { if (con != null) con.rollback(); } catch (SQLException ignored) { }
+                if ("40P01".equals(e.getSQLState())) return false;   // deadlock victim -> retry the same transaction
+                System.err.println("Task " + task + " " + e.getMessage());
+                return true;                                         // other error: do not loop forever
+            } finally {
+                try { if (con != null) con.close(); } catch (SQLException ignored) { }
+            }
+        }
+    }
 }
